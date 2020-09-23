@@ -1,0 +1,122 @@
+#!/bin/bash
+set -e
+
+if [ -f "$SDC_CONF/autoscale.conf" ]; then
+        . $SDC_CONF/autoscale.conf
+else
+        echo "Autoscaling settings file missing $SDC_CONF/autoscale.conf"
+        exit 0
+fi
+
+if [[ "$AUTOSCALING_ENABLED" != "yes" ]]; then
+    echo "Autoscaling configuration disabled"
+    exit 0
+fi
+
+if [ -z "$API_KEY" ]; then
+    echo "API_KEY must be specified in $SDC_CONF/autoscale.conf"
+    exit 1
+fi
+
+if [ -z "$API_ENDPOINT" ]; then
+    echo "API_ENDPOINT must be specified in $SDC_CONF/autoscale.conf"
+    exit 1
+fi
+
+function get_port_and_protocol {
+    PORT=$(grep ^https.port= ${SDC_CONF}/sdc.properties | cut -d '=' -f2)
+    PROTOCOL=https
+    if [ -z "$PORT" ] || [ "$PORT" = "-1" ]; then
+        PORT=$(grep ^http.port= ${SDC_CONF}/sdc.properties | cut -d '=' -f2)
+        PROTOCOL=http
+    fi
+    if [ -z "$PORT" ] || [ "$PORT" = "-1" ]; then
+        PORT=18630
+    fi
+}
+
+function pre_start {
+    if [ -s "$SDC_CONF/application-token.txt" ]; then
+        echo "Auth token already exists in ${SDC_CONF}/application-token.txt. SDC already registered. Exiting."
+        exit 0
+    fi
+
+    echo "Generating authentication token"
+    result=$(curl -s -S -X POST -d '{"action": "pre-start"}' $API_ENDPOINT -H "x-api-key: $API_KEY")
+
+    error=$(echo $result | python -mjson.tool | awk -F'"' '/error/{print $4}')
+    authToken=$(echo $result | python -mjson.tool | awk -F'"' '/response/{print $4}')
+
+    if [ -n "$error" ]; then
+        echo "Error generating authentication token: $error"
+        exit 1
+    fi
+
+    # Persist auth token
+    echo "${authToken}" > "${SDC_CONF}/application-token.txt"
+
+    get_port_and_protocol
+
+    base_url="${PROTOCOL}://${BASE_URL}:${PORT}"
+
+    echo "Setting sdc.base.http.url in sdc.properties to ${base_url}"
+    sed -i "s|#sdc.base.http.url=.*|sdc.base.http.url=${base_url}|" ${SDC_CONF}/sdc.properties
+
+    echo "Enabling Control Hub"
+    sed -i "s|dpm.enabled=.*|dpm.enabled=true|" ${SDC_CONF}/dpm.properties
+    sed -i "s|dpm.base.url=.*|dpm.base.url=${SCH_URL}|" ${SDC_CONF}/dpm.properties
+}
+
+function post_start {
+    get_port_and_protocol
+
+    # Wait until we see the Control Hub auth redirect
+    until [ $(curl -s -S --output /dev/null -k ${PROTOCOL}://${BASE_URL}:${PORT} -w "%{http_code}" 2>/dev/null) -eq 302 ]
+    do
+        sleep 5
+    done
+
+    sleep 10
+
+    echo "Configuring SDC in Control Hub"
+    SDC_ID=$(< ${SDC_DATA}/sdc.id)
+    result=$(curl -s -S -X POST -d "{\"action\": \"post-start\", \"sdcId\": \"${SDC_ID}\", \"labels\": \"${LABELS}\", \"groups\": \"${GROUP}\"}" $API_ENDPOINT -H "x-api-key: $API_KEY")
+
+    error=$(echo $result | python -mjson.tool | awk -F'"' '/error/{print $4}')
+    authToken=$(echo $result | python -mjson.tool | awk -F'"' '/response/{print $4}')
+
+    if [ -n "$error" ]; then
+        echo "Error configuring SDC in Control Hub: $error"
+        exit 1
+    fi
+
+    echo "$response"
+}
+
+function pre_stop {
+    echo "Gracefully unregistering SDC"
+    SDC_ID=$(< ${SDC_DATA}/sdc.id)
+    result=$(curl -s -S -X POST -d "{\"action\": \"pre-stop\", \"sdcId\": \"${SDC_ID}\"}" $API_ENDPOINT -H "x-api-key: $API_KEY")
+
+    error=$(echo $result | python -mjson.tool | awk -F'"' '/error/{print $4}')
+    authToken=$(echo $result | python -mjson.tool | awk -F'"' '/response/{print $4}')
+
+    if [ -n "$error" ]; then
+        echo "Error unregistering SDC: $error"
+        exit 1
+    fi
+
+    echo "$response"
+
+    echo "Disabling Control Hub locally"
+    > ${SDC_CONF}/application-token.txt
+    sed -i "s|dpm.enabled=.*|dpm.enabled=false|" ${SDC_CONF}/dpm.properties
+}
+
+if [[ "$1" = "pre_start" ]]; then
+    pre_start
+elif [[ "$1" = "post_start" ]]; then
+    post_start
+elif [[ "$1" = "pre_stop" ]]; then
+    pre_stop
+fi
