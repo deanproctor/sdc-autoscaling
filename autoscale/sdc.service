@@ -14,8 +14,8 @@
 
 [Unit]
 Description=StreamSets Data Collector (SDC)
-After=network-online.target
-Requires=network-online.target
+After=network-online.target cloud-final.target
+Requires=network-online.target cloud-final.target
 
 [Service]
 User=sdc
